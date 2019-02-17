@@ -1,0 +1,385 @@
+diff --git a/go-path/src/tidwall/evio/evio.go b/go-path/src/tidwall/evio/evio.go
+index 8e31287..d222514 100644
+--- a/go-path/src/tidwall/evio/evio.go
++++ b/go-path/src/tidwall/evio/evio.go
+@@ -62,6 +62,8 @@ type Conn interface {
+ 	RemoteAddr() net.Addr
+ 	// Wake triggers a Data event for this connection.
+ 	Wake()
++
++	WriteAhead([]byte) []byte
+ }
+ 
+ // LoadBalance sets the load balancing method.
+@@ -113,8 +115,10 @@ type Events struct {
+ 	// underlying socket connection. It can be freely used in goroutines
+ 	// and should be closed when it's no longer needed.
+ 	Detached func(c Conn, rwc io.ReadWriteCloser) (action Action)
++
+ 	// PreWrite fires just before any data is written to any client socket.
+-	PreWrite func()
++	// PreWrite func()
++
+ 	// Data fires when a connection sends the server data.
+ 	// The in parameter is the incoming data.
+ 	// Use the out return value to write data to the connection.
+diff --git a/go-path/src/tidwall/evio/evio_other.go b/go-path/src/tidwall/evio/evio_other.go
+index 31b9231..7b66b3a 100644
+--- a/go-path/src/tidwall/evio/evio_other.go
++++ b/go-path/src/tidwall/evio/evio_other.go
+@@ -10,6 +10,7 @@ import (
+ 	"errors"
+ 	"net"
+ 	"os"
++	"sync/atomic"
+ )
+ 
+ func (ln *listener) close() {
+@@ -39,3 +40,14 @@ func reuseportListenPacket(proto, addr string) (l net.PacketConn, err error) {
+ func reuseportListen(proto, addr string) (l net.Listener, err error) {
+ 	return nil, errors.New("reuseport is not available")
+ }
++
++var EpollWaitTimeout = int32(-1)
++
++func SetEpollWait(value int32) {
++	println("EpollWaitTimeout other ", value)
++	atomic.StoreInt32(&EpollWaitTimeout, value)
++}
++
++func GetEpollWait() int32 {
++	return atomic.LoadInt32(&EpollWaitTimeout)
++}
+diff --git a/go-path/src/tidwall/evio/evio_std.go b/go-path/src/tidwall/evio/evio_std.go
+index 4eb3e27..17684b2 100644
+--- a/go-path/src/tidwall/evio/evio_std.go
++++ b/go-path/src/tidwall/evio/evio_std.go
+@@ -35,12 +35,13 @@ type stdudpconn struct {
+ 	in         []byte
+ }
+ 
+-func (c *stdudpconn) Context() interface{}       { return nil }
+-func (c *stdudpconn) SetContext(ctx interface{}) {}
+-func (c *stdudpconn) AddrIndex() int             { return c.addrIndex }
+-func (c *stdudpconn) LocalAddr() net.Addr        { return c.localAddr }
+-func (c *stdudpconn) RemoteAddr() net.Addr       { return c.remoteAddr }
+-func (c *stdudpconn) Wake()                      {}
++func (c *stdudpconn) Context() interface{}         { return nil }
++func (c *stdudpconn) SetContext(ctx interface{})   {}
++func (c *stdudpconn) AddrIndex() int               { return c.addrIndex }
++func (c *stdudpconn) LocalAddr() net.Addr          { return c.localAddr }
++func (c *stdudpconn) RemoteAddr() net.Addr         { return c.remoteAddr }
++func (c *stdudpconn) Wake()                        {}
++func (c *stdudpconn) WriteAhead(out []byte) []byte { return out }
+ 
+ type stdloop struct {
+ 	idx   int               // loop index
+@@ -64,12 +65,13 @@ type wakeReq struct {
+ 	c *stdconn
+ }
+ 
+-func (c *stdconn) Context() interface{}       { return c.ctx }
+-func (c *stdconn) SetContext(ctx interface{}) { c.ctx = ctx }
+-func (c *stdconn) AddrIndex() int             { return c.addrIndex }
+-func (c *stdconn) LocalAddr() net.Addr        { return c.localAddr }
+-func (c *stdconn) RemoteAddr() net.Addr       { return c.remoteAddr }
+-func (c *stdconn) Wake()                      { c.loop.ch <- wakeReq{c} }
++func (c *stdconn) Context() interface{}         { return c.ctx }
++func (c *stdconn) SetContext(ctx interface{})   { c.ctx = ctx }
++func (c *stdconn) AddrIndex() int               { return c.addrIndex }
++func (c *stdconn) LocalAddr() net.Addr          { return c.localAddr }
++func (c *stdconn) RemoteAddr() net.Addr         { return c.remoteAddr }
++func (c *stdconn) Wake()                        { c.loop.ch <- wakeReq{c} }
++func (c *stdconn) WriteAhead(out []byte) []byte { return out }
+ 
+ type stdin struct {
+ 	c  *stdconn
+@@ -380,9 +382,6 @@ func stdloopRead(s *stdserver, l *stdloop, c *stdconn, in []byte) error {
+ 	if s.events.Data != nil {
+ 		out, action := s.events.Data(c, in)
+ 		if len(out) > 0 {
+-			if s.events.PreWrite != nil {
+-				s.events.PreWrite()
+-			}
+ 			c.conn.Write(out)
+ 		}
+ 		switch action {
+@@ -401,9 +400,6 @@ func stdloopReadUDP(s *stdserver, l *stdloop, c *stdudpconn) error {
+ 	if s.events.Data != nil {
+ 		out, action := s.events.Data(c, c.in)
+ 		if len(out) > 0 {
+-			if s.events.PreWrite != nil {
+-				s.events.PreWrite()
+-			}
+ 			s.lns[c.addrIndex].pconn.WriteTo(out, c.remoteAddr)
+ 		}
+ 		switch action {
+@@ -435,9 +431,6 @@ func stdloopAccept(s *stdserver, l *stdloop, c *stdconn) error {
+ 	if s.events.Opened != nil {
+ 		out, opts, action := s.events.Opened(c)
+ 		if len(out) > 0 {
+-			if s.events.PreWrite != nil {
+-				s.events.PreWrite()
+-			}
+ 			c.conn.Write(out)
+ 		}
+ 		if opts.TCPKeepAlive > 0 {
+diff --git a/go-path/src/tidwall/evio/evio_unix.go b/go-path/src/tidwall/evio/evio_unix.go
+index 16c696e..a69d137 100644
+--- a/go-path/src/tidwall/evio/evio_unix.go
++++ b/go-path/src/tidwall/evio/evio_unix.go
+@@ -8,6 +8,7 @@ package evio
+ 
+ import (
+ 	"io"
++	"log"
+ 	"net"
+ 	"os"
+ 	"runtime"
+@@ -15,9 +16,10 @@ import (
+ 	"sync/atomic"
+ 	"syscall"
+ 	"time"
++	"unsafe"
+ 
+ 	reuseport "github.com/kavu/go_reuseport"
+-	"github.com/tidwall/evio/internal"
++	"tidwall/evio/internal"
+ )
+ 
+ type conn struct {
+@@ -46,6 +48,26 @@ func (c *conn) Wake() {
+ 	}
+ }
+ 
++func (c *conn) WriteAhead(out []byte) []byte {
++	if len(out) != 0 {
++		n, err := write(c.fd, out)
++		if err != nil {
++			if err != syscall.EAGAIN {
++				//return loopCloseConn(s, l, c, err)
++				log.Fatal("WriteAhead err != syscall.EAGAIN")
++			}
++			n = 0
++			//println("wtite EAGAIN")
++		}
++		if n == len(out) {
++			return nil
++		} else {
++			return out[n:]
++		}
++	}
++	return out
++}
++
+ type server struct {
+ 	events   Events             // user events
+ 	loops    []*loop            // all the loops
+@@ -162,13 +184,6 @@ func loopCloseConn(s *server, l *loop, c *conn, err error) error {
+ 	atomic.AddInt32(&l.count, -1)
+ 	delete(l.fdconns, c.fd)
+ 	syscall.Close(c.fd)
+-	if s.events.Closed != nil {
+-		switch s.events.Closed(c, err) {
+-		case None:
+-		case Shutdown:
+-			return errClosing
+-		}
+-	}
+ 	return nil
+ }
+ 
+@@ -328,9 +343,6 @@ func loopUDPRead(s *server, l *loop, lnidx, fd int) error {
+ 		in := append([]byte{}, l.packet[:n]...)
+ 		out, action := s.events.Data(c, in)
+ 		if len(out) > 0 {
+-			if s.events.PreWrite != nil {
+-				s.events.PreWrite()
+-			}
+ 			syscall.Sendto(fd, out, 0, sa)
+ 		}
+ 		switch action {
+@@ -353,10 +365,15 @@ func loopOpened(s *server, l *loop, c *conn) error {
+ 		}
+ 		c.action = action
+ 		c.reuse = opts.ReuseInputBuffer
+-		if opts.TCPKeepAlive > 0 {
+-			if _, ok := s.lns[c.lnidx].ln.(*net.TCPListener); ok {
+-				internal.SetKeepAlive(c.fd, int(opts.TCPKeepAlive/time.Second))
+-			}
++
++		if err := syscall.SetsockoptInt(c.fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1); err != nil {
++			log.Fatal("syscall.IPPROTO_TCP, syscall.TCP_NODELAY")
++		}
++		if err := syscall.SetsockoptInt(c.fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 16*1024); err != nil {
++			log.Fatal("syscall.SOL_SOCKET, syscall.SO_SNDBUF")
++		}
++		if err := syscall.SetsockoptInt(c.fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 16*1024); err != nil {
++			log.Fatal("syscall.SOL_SOCKET, syscall.SO_RCVBUF")
+ 		}
+ 	}
+ 	if len(c.out) == 0 && c.action == None {
+@@ -366,9 +383,6 @@ func loopOpened(s *server, l *loop, c *conn) error {
+ }
+ 
+ func loopWrite(s *server, l *loop, c *conn) error {
+-	if s.events.PreWrite != nil {
+-		s.events.PreWrite()
+-	}
+ 	n, err := syscall.Write(c.fd, c.out)
+ 	if err != nil {
+ 		if err == syscall.EAGAIN {
+@@ -419,9 +433,62 @@ func loopWake(s *server, l *loop, c *conn) error {
+ 	return nil
+ }
+ 
++var _zero uintptr
++
++var (
++	errEAGAIN error = syscall.EAGAIN
++	errEINVAL error = syscall.EINVAL
++	errENOENT error = syscall.ENOENT
++)
++
++// errnoErr returns common boxed Errno values, to prevent
++// allocations at runtime.
++func errnoErr(e syscall.Errno) error {
++	switch e {
++	case 0:
++		return nil
++	case syscall.EAGAIN:
++		return errEAGAIN
++	case syscall.EINVAL:
++		return errEINVAL
++	case syscall.ENOENT:
++		return errENOENT
++	}
++	return e
++}
++func read(fd int, p []byte) (n int, err error) {
++	var _p0 unsafe.Pointer
++	if len(p) > 0 {
++		_p0 = unsafe.Pointer(&p[0])
++	} else {
++		_p0 = unsafe.Pointer(&_zero)
++	}
++	r0, _, e1 := syscall.Syscall(syscall.SYS_READ, uintptr(fd), uintptr(_p0), uintptr(len(p)))
++	n = int(r0)
++	if e1 != 0 {
++		err = errnoErr(e1)
++	}
++	return
++}
++
++func write(fd int, p []byte) (n int, err error) {
++	var _p0 unsafe.Pointer
++	if len(p) > 0 {
++		_p0 = unsafe.Pointer(&p[0])
++	} else {
++		_p0 = unsafe.Pointer(&_zero)
++	}
++	r0, _, e1 := syscall.Syscall(syscall.SYS_WRITE, uintptr(fd), uintptr(_p0), uintptr(len(p)))
++	n = int(r0)
++	if e1 != 0 {
++		err = errnoErr(e1)
++	}
++	return
++}
++
+ func loopRead(s *server, l *loop, c *conn) error {
+ 	var in []byte
+-	n, err := syscall.Read(c.fd, l.packet)
++	n, err := read(c.fd, l.packet) //syscall.Read(c.fd, l.packet)
+ 	if n == 0 || err != nil {
+ 		if err == syscall.EAGAIN {
+ 			return nil
+@@ -429,14 +496,25 @@ func loopRead(s *server, l *loop, c *conn) error {
+ 		return loopCloseConn(s, l, c, err)
+ 	}
+ 	in = l.packet[:n]
+-	if !c.reuse {
+-		in = append([]byte{}, in...)
+-	}
+ 	if s.events.Data != nil {
+ 		out, action := s.events.Data(c, in)
+ 		c.action = action
+-		if len(out) > 0 {
+-			c.out = append([]byte{}, out...)
++		if len(out) != 0 {
++			n, err = write(c.fd, out)
++			if err != nil {
++				if err != syscall.EAGAIN {
++					return loopCloseConn(s, l, c, err)
++				}
++				n = 0
++				println("wtite EAGAIN")
++			}
++			if n == len(out) {
++				c.out = nil
++			} else {
++				c.out = out[n:]
++				println("wtite tail ", len(c.out))
++			}
++			//c.out = out // append([]byte{}, out...) // todo : can I just copy pointer and write only once? Ramen?
+ 		}
+ 	}
+ 	if len(c.out) != 0 || c.action != None {
+@@ -532,3 +610,12 @@ func reuseportListenPacket(proto, addr string) (l net.PacketConn, err error) {
+ func reuseportListen(proto, addr string) (l net.Listener, err error) {
+ 	return reuseport.Listen(proto, addr)
+ }
++
++func SetEpollWait(value int32) {
++	println("EpollWaitTimeout unix ", value)
++	atomic.StoreInt32(&internal.EpollWaitTimeout, value)
++}
++
++func GetEpollWait() int32 {
++	return atomic.LoadInt32(&internal.EpollWaitTimeout)
++}
+diff --git a/go-path/src/tidwall/evio/internal/internal_linux.go b/go-path/src/tidwall/evio/internal/internal_linux.go
+index 6bbaffa..b79e695 100644
+--- a/go-path/src/tidwall/evio/internal/internal_linux.go
++++ b/go-path/src/tidwall/evio/internal/internal_linux.go
+@@ -5,6 +5,7 @@
+ package internal
+ 
+ import (
++	"sync/atomic"
+ 	"syscall"
+ )
+ 
+@@ -48,11 +49,14 @@ func (p *Poll) Trigger(note interface{}) error {
+ 	return err
+ }
+ 
++var EpollWaitTimeout = int32(-1)
++
+ // Wait ...
+ func (p *Poll) Wait(iter func(fd int, note interface{}) error) error {
+-	events := make([]syscall.EpollEvent, 64)
++	events := make([]syscall.EpollEvent, 256)
+ 	for {
+-		n, err := syscall.EpollWait(p.fd, events, -1)
++		wait := int(atomic.LoadInt32(&EpollWaitTimeout))
++		n, err := syscall.EpollWait(p.fd, events, wait)
+ 		if err != nil && err != syscall.EINTR {
+ 			return err
+ 		}
+diff --git a/go-path/src/tidwall/evio/vendor/github.com/kavu/go_reuseport/tcp.go b/go-path/src/tidwall/evio/vendor/github.com/kavu/go_reuseport/tcp.go
+index 76540a1..e491dd5 100644
+--- a/go-path/src/tidwall/evio/vendor/github.com/kavu/go_reuseport/tcp.go
++++ b/go-path/src/tidwall/evio/vendor/github.com/kavu/go_reuseport/tcp.go
+@@ -113,6 +113,12 @@ func NewReusablePortListener(proto, addr string) (l net.Listener, err error) {
+ 		return nil, err
+ 	}
+ 
++
++	if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_DEFER_ACCEPT, 1); err != nil {
++		syscall.Close(fd)
++		return nil, err
++	}
++
+ 	if err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, reusePort, 1); err != nil {
+ 		syscall.Close(fd)
+ 		return nil, err
