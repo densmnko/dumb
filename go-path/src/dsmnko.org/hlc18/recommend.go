@@ -130,22 +130,14 @@ var selectionPool = sync.Pool{
 	New: func() interface{} { return make([]uint64, 1024*16) },
 }
 
-func token(id uint32, common uint64, myBirth int32) uint64 {
-	return uint64(id) | (common << 24) | (uint64(abs(myBirth-Store.Accounts[id-1].birth)) << 32)
+func token(id uint64, common uint64, myBirth int32) uint64 {
+	return (common << 61) | (uint64(math.MaxInt32-abs(myBirth-Store.Accounts[id-1].birth)) << 29) | (id)
 }
 
-func tokenCommon(token uint64) uint32 {
-	return uint32((token << 32) >> (24 + 32))
-}
-
-var TOKEN_MASK = uint64(mask(0, 24))
+var TOKEN_MASK = mask(0, 24)
 
 func tokenId(token uint64) uint32 {
 	return uint32(token & TOKEN_MASK)
-}
-
-func tokenBirthDiff(token uint64) uint64 {
-	return token >> 32
 }
 
 func Recommend(myId uint32, limit int, params map[string]string) []uint32 {
@@ -234,52 +226,19 @@ func Recommend(myId uint32, limit int, params map[string]string) []uint32 {
 				} else if common > maxSeenInterests {
 					maxSeenInterests = common
 					maxSeenInterestsCount = 1
-					selected = append(selected, token(id, common, me.birth))
+					selected = append(selected, token(uint64(id), common, me.birth))
 				} else if common == maxSeenInterests {
 					maxSeenInterestsCount++
-					selected = append(selected, token(id, common, me.birth))
+					selected = append(selected, token(uint64(id), common, me.birth))
 				} else if common > 0 && maxSeenInterestsCount < limit {
 					// с 0 совпавшими интересами нас не интересуют совсем
-					selected = append(selected, token(id, common, me.birth))
+					selected = append(selected, token(uint64(id), common, me.birth))
 				}
 			}
 
 			if len(selected) > 0 {
 				var order = func(i int, j int) bool {
-					// обратная сортировка, в начале массива будут "лучшие" записи
-					// Далее идёт совместимость по интересам.
-					// Чем больше совпавших интересов у пользователей, тем более они совместимы
-					ti := selected[i]
-					tj := selected[j]
-					commonI := tokenCommon(ti)
-					commonJ := tokenCommon(tj)
-					if commonI > commonJ {
-						return true
-					} else if commonI == commonJ {
-						// Третий по значению параметр - различие в возрасте. Чем больше разница, тем меньше совместимость
-						diffI := tokenBirthDiff(ti)
-						diffJ := tokenBirthDiff(tj)
-						if diffI < diffJ {
-							return true
-						} else if diffI == diffJ {
-							return tokenId(ti) < tokenId(tj)
-						}
-						/*
-							iid := tokenId(selected[i])
-							jid := tokenId(selected[j])
-							ai := &Store.Accounts[iid-1]
-							aj := &Store.Accounts[jid-1]
-							diffI := abs(me.birth - ai.birth)
-							diffJ := abs(me.birth - aj.birth)
-							if diffI < diffJ {
-								return true
-							} else if diffI == diffJ {
-								return iid < jid
-							}
-						*/
-						return false
-					}
-					return false
+					return selected[i] > selected[j]
 				}
 				sort.Slice(selected, order)
 
